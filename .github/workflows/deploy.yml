@@ -1,0 +1,185 @@
+name: Build & Deploy
+
+# Build in CI, ship the artifact. imrnes has Node but no build toolchain worth
+# keeping there, and the host also runs other people's services — a `next build`
+# on it would compete for the RAM that keeps them up.
+#
+# The deploy runs through a key that is restricted to a forced command
+# (`/usr/local/bin/gh-actions-homepage`), so the runner cannot obtain a shell on
+# the host even if the key leaks. The allowlist is the deploy script plus a
+# read-only probe; nothing outside it is reachable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Serialise deploys so two merges cannot interleave a release cutover. A PR run
+  # is cancelled by a newer one; a push to main never is.
+  group: homepage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  VPS_HOST: ${{ secrets.VPS_HOST }}
+  VPS_USER: ${{ secrets.VPS_USER }}
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  artifact:
+    name: Build release payload
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      # Only what `next start` needs at run time. `app/`, `components/` and the
+      # TypeScript sources are not shipped: the built output is self-contained,
+      # and shipping the sources would invite someone to "fix" the running copy
+      # by hand on the host instead of in the repository.
+      - name: Assemble the payload
+        run: |
+          set -euo pipefail
+          mkdir -p payload
+          cp -r .next payload/.next
+          cp -r public payload/public
+          cp package.json package-lock.json next.config.ts payload/
+          # `next start` reads this; without it a production server refuses to boot.
+          cp -r node_modules payload/node_modules
+          # Prune dev-only packages so the artifact is the size of the runtime.
+          cd payload
+          npm prune --omit=dev --no-audit --no-fund >/dev/null 2>&1 || true
+          cd ..
+          tar -czf homepage-payload.tar.gz -C payload .
+          du -h homepage-payload.tar.gz
+
+      - name: Upload the payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: homepage-payload
+          path: homepage-payload.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to imrnes
+    needs: [ci, artifact]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: homepage-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Download the payload
+        uses: actions/download-artifact@v7
+        with:
+          name: homepage-payload
+
+      - name: Install the deploy key
+        # The key is written by redirection rather than echoed through a pipe, so
+        # it never appears in any process's argv. `mkdir` first because `install`
+        # does not create parents and `~/.ssh` does not exist on a fresh runner.
+        env:
+          KEY_PATH: ${{ runner.temp }}/deploy_key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          # A malformed key fails here rather than inside ssh with a bare 255.
+          ssh-keygen -y -f "$KEY_PATH" >/dev/null
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Verify the host is reachable and the key is restricted
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
+        run: |
+          set -euo pipefail
+          # An allowlisted command: `true` is not in the allowlist and would be
+          # refused, which reads as "cannot SSH" when the key is fine.
+          ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+              "$VPS_USER@$VPS_HOST" "status"
+
+          # Negative control. If the forced command ever lets a shell through,
+          # the key is not restricted and the deploy must not proceed.
+          if ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+               "$VPS_USER@$VPS_HOST" "id" 2>/dev/null; then
+            echo "::error::the deploy key obtained a shell - refusing to deploy"
+            exit 1
+          fi
+          echo "key is restricted to the deploy allowlist (shell refused as expected)"
+
+      - name: Ship the payload
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
+        run: |
+          set -euo pipefail
+          scp -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+              homepage-payload.tar.gz \
+              "$VPS_USER@$VPS_HOST:upload"
+
+      - name: Deploy
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
+        run: |
+          set -euo pipefail
+          ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+              "$VPS_USER@$VPS_HOST" "deploy"
+
+      - name: Verify the site answers
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
+        run: |
+          set -euo pipefail
+          # Read back over the real hostname rather than trusting the script's
+          # exit code: a unit can be active while Caddy serves a 502.
+          #
+          # `--resolve` pins the name to the origin's address on purpose. DNS for
+          # imrnes.team is not managed here, so a plain request could be answered
+          # by whatever the record currently points at (it pointed at Vercel when
+          # this workflow was written) and report a cheerful 200 for a host this
+          # deploy never touched. Pinning tests the thing that was deployed.
+          for path in / /achievement /leaderboard; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 \
+                     --resolve "imrnes.team:443:$VPS_HOST" \
+                     "https://imrnes.team$path")
+            echo "GET $path -> $code"
+            [ "$code" = "200" ] || { echo "::error::$path returned $code"; exit 1; }
+          done
+
+      - name: Report the DNS state
+        # Not a gate. The site can be correct at the origin while the public name
+        # still points elsewhere, and that is a DNS problem rather than a deploy
+        # failure - so it is reported, never enforced, and never silently ignored.
+        run: |
+          resolved=$(dig +short imrnes.team @1.1.1.1 | tail -1)
+          echo "imrnes.team resolves to: ${resolved:-nothing}"
+          if [ "$resolved" != "$VPS_HOST" ]; then
+            echo "::warning::imrnes.team does not point at $VPS_HOST yet - the origin is deployed but the public name still resolves to ${resolved:-nothing}"
+          fi
+
+      - name: Clean up the key
+        if: always()
+        run: rm -f "${{ runner.temp }}/deploy_key"

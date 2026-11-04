@@ -1,0 +1,61 @@
+#!/bin/bash
+# The only thing the CI deploy key can run on imrnes.
+#
+# Installed at /usr/local/bin/gh-actions-homepage and referenced from
+# authorized_keys as a forced command, so a leaked key cannot open a shell: ssh
+# runs this script with the requested command in SSH_ORIGINAL_COMMAND, and
+# anything outside the allowlist is refused.
+#
+# `scp` is a special case. It runs over ssh, so the forced command receives an
+# `scp -t <dir>` invocation instead of a name from the allowlist. It is accepted
+# only when the destination is the upload directory, because that is the one
+# place CI is allowed to write.
+
+set -euo pipefail
+
+UPLOAD_DIR=/opt/imrnes-homepage/upload
+DEPLOY_SCRIPT=/opt/imrnes-homepage/deploy.sh
+
+log() { logger -t gh-actions-homepage -- "$*" 2>/dev/null || true; }
+
+# `scp` support, restricted to one destination.
+if [[ "${SSH_ORIGINAL_COMMAND:-}" == "scp -t "* ]]; then
+  dest=${SSH_ORIGINAL_COMMAND#scp -t }
+  # Normalise so `/opt/imrnes-homepage/upload/` and the same path with a
+  # trailing slash or a `.` component are all recognised.
+  dest=$(readlink -m "$dest")
+  if [ "$dest" != "$UPLOAD_DIR" ]; then
+    log "refused scp to $dest"
+    echo "refused: uploads are only accepted into $UPLOAD_DIR" >&2
+    exit 1
+  fi
+  log "scp accepted into $dest"
+  exec scp -t "$dest"
+fi
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  status)
+    # A cheap, meaningful probe the workflow uses to prove the key works before
+    # it tries to deploy. It must not be `true`: that is not in the allowlist and
+    # a refusal reads as a broken key.
+    if [ -f "$DEPLOY_SCRIPT" ]; then
+      echo "ready: deploy script present"
+    else
+      echo "not ready: $DEPLOY_SCRIPT is missing" >&2
+      exit 1
+    fi
+    ;;
+  deploy)
+    log "deploy requested"
+    exec bash "$DEPLOY_SCRIPT"
+    ;;
+  ""|shell|bash|sh|-bash)
+    echo "this key is restricted to the deploy allowlist" >&2
+    exit 1
+    ;;
+  *)
+    log "refused command: $SSH_ORIGINAL_COMMAND"
+    echo "refused: only 'status' and 'deploy' are allowed" >&2
+    exit 1
+    ;;
+esac

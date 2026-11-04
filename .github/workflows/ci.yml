@@ -1,0 +1,50 @@
+name: CI
+
+# The gate. `deploy.yml` calls this file rather than copying its steps, so the
+# check a PR shows and the check a deploy depends on are the same definition.
+#
+# There is no `push: branches: [main]` trigger on purpose: a push to main runs
+# `deploy.yml`, which calls this file as its gate job. Triggering on both would
+# run the whole suite twice per merge, and two paths to the same verdict is how
+# they drift apart.
+on:
+  pull_request:
+  workflow_call:
+
+concurrency:
+  # A superseded PR run is no longer actionable, so cancel it. The called case
+  # must get its own group: sharing the caller's would let `cancel-in-progress`
+  # abort the very run that invoked this file.
+  group: ${{ github.event_name == 'pull_request' && format('homepage-ci-pr-{0}', github.ref) || format('homepage-ci-call-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      # A real production build, not `next build --dry-run`: the two pages that
+      # fetch CTFtime and the CVE feed do it at build time, so a broken upstream
+      # contract or a changed response shape fails here rather than after a
+      # deploy. That is also why this step needs network access, which a hosted
+      # runner has.
+      - name: Build
+        run: npm run build

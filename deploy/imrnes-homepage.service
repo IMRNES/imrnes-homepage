@@ -1,0 +1,36 @@
+[Unit]
+Description=imrnes.team homepage (Next.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=imrnes-homepage
+Group=imrnes-homepage
+WorkingDirectory=/opt/imrnes-homepage/current
+# The port is bound on loopback only. Caddy is the only thing that talks to it,
+# and a public bind here would be a second, unauthenticated way in that bypasses
+# TLS entirely.
+Environment=NODE_ENV=production
+Environment=PORT=3200
+Environment=HOSTNAME=127.0.0.1
+Environment=NEXT_TELEMETRY_DISABLED=1
+ExecStart=/usr/bin/node /opt/imrnes-homepage/current/node_modules/next/dist/bin/next start --port 3200 --hostname 127.0.0.1
+Restart=always
+RestartSec=3
+
+# Hardening: the app reads its own release directory and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/imrnes-homepage
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
