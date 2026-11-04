@@ -1,4 +1,8 @@
 User-agent: *
 Allow: /
 
+# Per-user and internal views. They render without a session, but indexing them
+# fills search results with empty pages.
+Disallow: /api/
+
 Sitemap: https://imrnes.team/sitemap.xml
