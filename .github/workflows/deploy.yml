@@ -136,7 +136,12 @@ jobs:
           DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
-          scp -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+          # `-O` forces the original scp protocol. Without it, scp negotiates
+          # SFTP, which the forced command on the host does not serve - and the
+          # failure surfaces as a bare "scp: Connection closed" that says nothing
+          # about the real cause. The allowlist accepts `scp -t`, which is what
+          # `-O` produces.
+          scp -O -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
               homepage-payload.tar.gz \
               "$VPS_USER@$VPS_HOST:upload"
 

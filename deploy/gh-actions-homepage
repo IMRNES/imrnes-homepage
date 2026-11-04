@@ -18,12 +18,31 @@ DEPLOY_SCRIPT=/opt/imrnes-homepage/deploy.sh
 
 log() { logger -t gh-actions-homepage -- "$*" 2>/dev/null || true; }
 
+# SFTP is refused explicitly. A modern `scp` negotiates SFTP by default, and
+# without this branch the refusal reaches the caller as a bare "Connection
+# closed" with no hint that `-O` (original scp protocol) is what is wanted.
+if [[ "${SSH_ORIGINAL_COMMAND:-}" == "sftp"* ]]; then
+  log "refused sftp"
+  echo "refused: sftp is not available on this key; use scp -O (original protocol)" >&2
+  exit 1
+fi
+
 # `scp` support, restricted to one destination.
+#
+# The destination arrives as whatever the client typed, which for
+# `scp file host:upload` is the *relative* string `upload` - the remote shell
+# resolves it against the login home, not against the upload directory. So a
+# relative name that lands in the upload dir is accepted by resolving it the same
+# way ssh does, rather than requiring an absolute path the workflow would have to
+# remember to send.
 if [[ "${SSH_ORIGINAL_COMMAND:-}" == "scp -t "* ]]; then
   dest=${SSH_ORIGINAL_COMMAND#scp -t }
-  # Normalise so `/opt/imrnes-homepage/upload/` and the same path with a
-  # trailing slash or a `.` component are all recognised.
-  dest=$(readlink -m "$dest")
+  # Trim trailing slashes so `upload` and `upload/` compare equal.
+  dest=${dest%/}
+  case "$dest" in
+    "$UPLOAD_DIR"|upload|./upload) dest=$UPLOAD_DIR ;;
+    *) dest=$(readlink -m "$dest") ;;
+  esac
   if [ "$dest" != "$UPLOAD_DIR" ]; then
     log "refused scp to $dest"
     echo "refused: uploads are only accepted into $UPLOAD_DIR" >&2
