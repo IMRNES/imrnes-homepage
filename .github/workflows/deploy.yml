@@ -158,34 +158,35 @@ jobs:
           DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
-          # Read back over a real hostname rather than trusting the script's exit
+          # Read back over the real hostnames rather than trusting the script's exit
           # code: a unit can be active while Caddy serves a 502.
           #
-          # `www.imrnes.team` is the name that already resolves here and has a
-          # certificate, so it is what proves the origin serves. The apex is
-          # reported separately below rather than asserted: it currently resolves
-          # to Vercel, Caddy has no certificate for it, and pinning the apex to
-          # this origin would fail the deploy for a DNS record this workflow does
-          # not own.
-          for path in / /achievement /leaderboard; do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 \
-                     --resolve "www.imrnes.team:443:$VPS_HOST" \
-                     "https://www.imrnes.team$path")
-            echo "GET www.imrnes.team$path -> $code"
-            [ "$code" = "200" ] || { echo "::error::$path returned $code"; exit 1; }
+          # No `--resolve` pinning here. It was needed while the apex still pointed
+          # at Vercel, because a pinned request proves the origin while an unpinned
+          # one could be answered by a host this deploy never touched. Now that both
+          # names resolve here and Caddy holds certificates for them, an unpinned
+          # request is the stronger check: it proves DNS, TLS, the reverse proxy and
+          # the app together, which is what a reader actually experiences.
+          for name in imrnes.team www.imrnes.team; do
+            for path in / /achievement /leaderboard; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 \
+                       "https://$name$path")
+              echo "GET $name$path -> $code"
+              [ "$code" = "200" ] || { echo "::error::$name$path returned $code"; exit 1; }
+            done
           done
 
-      - name: Report the DNS state
-        # Not a gate. The origin can be correct while a public name still points
-        # elsewhere, and that is a DNS problem rather than a deploy failure - so it
-        # is reported, never enforced, and never silently ignored.
+      - name: Verify the DNS still points here
+        # A gate now, not a warning. The names were moved here deliberately; if one
+        # drifts back to another host, the deploy is shipping to a place nobody
+        # reaches and that must fail loudly rather than pass with a warning.
         run: |
+          set -euo pipefail
           for name in imrnes.team www.imrnes.team; do
             resolved=$(dig +short "$name" @1.1.1.1 | tail -1)
             echo "$name resolves to: ${resolved:-nothing}"
-            if [ "$resolved" != "$VPS_HOST" ]; then
-              echo "::warning::$name does not point at $VPS_HOST yet (currently ${resolved:-nothing}) - the origin is deployed, the public name is not"
-            fi
+            [ "$resolved" = "$VPS_HOST" ] \
+              || { echo "::error::$name points at ${resolved:-nothing}, not $VPS_HOST"; exit 1; }
           done
 
       - name: Clean up the key
